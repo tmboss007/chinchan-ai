@@ -1,8 +1,7 @@
 import streamlit as st
 import requests
 from streamlit_lottie import st_lottie
-from google import genai
-from google.genai import types
+import json
 import time
 from datetime import datetime
 
@@ -334,7 +333,17 @@ with col2:
 
 # --- 7. SIDEBAR ---
 st.sidebar.markdown('<h2 style="color:#ff4d4d;">🔐 ACCESS CONTROL</h2>', unsafe_allow_html=True)
-api_key = st.sidebar.text_input("GENAI_API_KEY:", type="password", help="Enter your Google Gemini API key")
+provider = st.sidebar.selectbox(
+    "🌐 AI Provider:",
+    ["⚡ Groq (Free & Fast)", "🔷 Google Gemini"],
+    help="Groq is free & blazing fast. Get a key at console.groq.com"
+)
+if "Groq" in provider:
+    api_key = st.sidebar.text_input("GROQ_API_KEY:", type="password", help="Get free key at console.groq.com")
+    active_model = "llama-3.3-70b-versatile"
+else:
+    api_key = st.sidebar.text_input("GEMINI_API_KEY:", type="password", help="Enter your Google Gemini API key")
+    active_model = "gemini-2.0-flash"
 st.sidebar.markdown("---")
 
 # Personality Mode
@@ -382,7 +391,7 @@ status_class = "status-online" if api_key else ""
 status_icon = "🟢" if api_key else "🟡"
 st.sidebar.markdown(f'{status_icon} STATUS: <span class="{status_class}">{status}</span>', unsafe_allow_html=True)
 st.sidebar.markdown(f"**Mode:** {personality}")
-st.sidebar.markdown(f"**Model:** Gemini 2.0 Flash")
+st.sidebar.markdown(f"**Model:** {active_model}")
 st.sidebar.markdown(f"**Temp:** {temperature}")
 
 st.sidebar.markdown("---")
@@ -447,32 +456,76 @@ if not st.session_state.messages:
                 })
                 st.rerun()
 
-# --- 10. CHAT INPUT & GEMINI API ---
-def call_gemini_with_retry(client, history_contents, system_prompt, temp, max_retries=3):
-    """Call Gemini API with automatic retry on rate limit errors."""
+# --- 10. CHAT INPUT & AI API ---
+def call_gemini_rest(api_key, messages, system_prompt, temp, max_retries=3):
+    """Call Google Gemini via direct REST API (no SDK needed)."""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
+    contents = []
+    for msg in messages:
+        role = "user" if msg["role"] == "user" else "model"
+        contents.append({"role": role, "parts": [{"text": msg["content"]}]})
+    payload = {
+        "contents": contents,
+        "systemInstruction": {"parts": [{"text": system_prompt}]},
+        "generationConfig": {"temperature": temp}
+    }
     for attempt in range(max_retries):
         try:
-            response = client.models.generate_content(
-                model="gemini-2.0-flash",
-                contents=history_contents,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_prompt,
-                    temperature=temp,
-                ),
-            )
-            return response, None
-        except Exception as e:
-            error_str = str(e)
-            if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+            resp = requests.post(url, json=payload, timeout=60)
+            if resp.status_code == 200:
+                data = resp.json()
+                return data["candidates"][0]["content"]["parts"][0]["text"], None
+            elif resp.status_code == 429:
                 if attempt < max_retries - 1:
-                    wait_time = (attempt + 1) * 15  # 15s, 30s, 45s
-                    st.toast(f"⏳ Rate limited. Retrying in {wait_time}s... (attempt {attempt + 2}/{max_retries})", icon="🔄")
-                    time.sleep(wait_time)
+                    wait = (attempt + 1) * 10
+                    st.toast(f"⏳ Rate limited. Retrying in {wait}s... (attempt {attempt+2}/{max_retries})", icon="🔄")
+                    time.sleep(wait)
                     continue
-                else:
-                    return None, "rate_limit"
+                return None, "rate_limit"
             else:
-                return None, error_str
+                return None, f"HTTP {resp.status_code}: {resp.text[:300]}"
+        except requests.exceptions.Timeout:
+            if attempt < max_retries - 1:
+                continue
+            return None, "Request timed out. Please try again."
+        except Exception as e:
+            return None, str(e)
+    return None, "unknown"
+
+def call_groq_api(api_key, messages, system_prompt, temp, max_retries=3):
+    """Call Groq API (free, fast inference for open-source models)."""
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    msgs = [{"role": "system", "content": system_prompt}]
+    for msg in messages:
+        msgs.append({"role": msg["role"], "content": msg["content"]})
+    payload = {
+        "model": "llama-3.3-70b-versatile",
+        "messages": msgs,
+        "temperature": temp,
+        "max_tokens": 4096
+    }
+    for attempt in range(max_retries):
+        try:
+            resp = requests.post(url, json=payload, headers=headers, timeout=60)
+            if resp.status_code == 200:
+                data = resp.json()
+                return data["choices"][0]["message"]["content"], None
+            elif resp.status_code == 429:
+                if attempt < max_retries - 1:
+                    wait = (attempt + 1) * 10
+                    st.toast(f"⏳ Rate limited. Retrying in {wait}s... (attempt {attempt+2}/{max_retries})", icon="🔄")
+                    time.sleep(wait)
+                    continue
+                return None, "rate_limit"
+            else:
+                return None, f"HTTP {resp.status_code}: {resp.text[:300]}"
+        except requests.exceptions.Timeout:
+            if attempt < max_retries - 1:
+                continue
+            return None, "Request timed out. Please try again."
+        except Exception as e:
+            return None, str(e)
     return None, "unknown"
 
 
@@ -487,7 +540,8 @@ if prompt := st.chat_input("Enter command..."):
     # Generate AI Response
     with st.chat_message("assistant", avatar="🤖"):
         if not api_key:
-            error_msg = "⚠️ **ACCESS DENIED** — Enter your Gemini API key in the sidebar to activate Chinchan Core."
+            prov_name = "Groq" if "Groq" in provider else "Gemini"
+            error_msg = f"⚠️ **ACCESS DENIED** — Enter your {prov_name} API key in the sidebar to activate Chinchan Core."
             st.markdown(error_msg)
             st.session_state.messages.append({"role": "assistant", "content": error_msg, "time": now})
         else:
@@ -505,32 +559,23 @@ if prompt := st.chat_input("Enter command..."):
             """, unsafe_allow_html=True)
 
             try:
-                client = genai.Client(api_key=api_key)
-
-                # Build conversation history for context
-                history_contents = []
                 system_prompt = PERSONALITIES[personality]
 
-                for msg in st.session_state.messages:
-                    role = "user" if msg["role"] == "user" else "model"
-                    history_contents.append(types.Content(
-                        role=role,
-                        parts=[types.Part.from_text(text=msg["content"])]
-                    ))
-
-                response, error = call_gemini_with_retry(
-                    client, history_contents, system_prompt, temperature
-                )
+                # Call the selected provider
+                if "Groq" in provider:
+                    reply, error = call_groq_api(api_key, st.session_state.messages, system_prompt, temperature)
+                else:
+                    reply, error = call_gemini_rest(api_key, st.session_state.messages, system_prompt, temperature)
 
                 typing_placeholder.empty()
 
                 if error == "rate_limit":
                     rate_msg = (
-                        "⏳ **RATE LIMIT REACHED** — Your free-tier Gemini API quota is exhausted.\n\n"
+                        "⏳ **RATE LIMIT REACHED** — API quota exhausted.\n\n"
                         "**What you can do:**\n"
                         "- ⏰ **Wait 1-2 minutes** and try again\n"
-                        "- 🔑 **Upgrade** to a paid plan at [ai.google.dev](https://ai.google.dev)\n"
-                        "- 📊 **Check usage** at [ai.dev/rate-limit](https://ai.dev/rate-limit)\n\n"
+                        "- 🔄 **Switch provider** in the sidebar (try Groq — it's free!)\n"
+                        "- 🔑 **Upgrade** your API plan\n\n"
                         "_Chinchan tried 3 times automatically before showing this._"
                     )
                     st.markdown(rate_msg)
@@ -540,7 +585,6 @@ if prompt := st.chat_input("Enter command..."):
                     st.markdown(error_msg)
                     st.session_state.messages.append({"role": "assistant", "content": error_msg, "time": now})
                 else:
-                    reply = response.text
                     resp_time = datetime.now().strftime("%H:%M")
                     st.markdown(reply)
                     st.markdown(f'<div class="msg-time">{resp_time}</div>', unsafe_allow_html=True)
